@@ -7,7 +7,8 @@ from PyQt5.QtGui import QStandardItemModel, QStandardItem, QImage, QPixmap, QIco
 from PyQt5.QtWidgets import (
     QWidget, QLabel, QLineEdit, QComboBox, QPushButton, QStyledItemDelegate,
     QListView, QGraphicsView, QMessageBox, QGridLayout, QHBoxLayout, QVBoxLayout,
-    QGroupBox, QCheckBox, QGraphicsScene, QTextEdit)
+    QGroupBox, QCheckBox, QGraphicsScene, QTextEdit, QStackedWidget, QTableWidget,
+    QTableWidgetItem, QHeaderView)
 
 from theme import COLORS
 
@@ -62,11 +63,14 @@ class QTextEditLogger(QObject):
 
 class CalibrationView(QWidget):
     load_requested = pyqtSignal()
+    capture_requested = pyqtSignal()
     calibrate_requested = pyqtSignal()
     save_requested = pyqtSignal()
+    recognize_requested = pyqtSignal()
     clear_all_requested = pyqtSignal()
     clear_selected_requested = pyqtSignal()
     image_selected = pyqtSignal(int)
+    recog_calib_browse_requested = pyqtSignal()
 
     def __init__(self):
         super().__init__()
@@ -121,15 +125,59 @@ class CalibrationView(QWidget):
         input_group.setLayout(input_layout)
         left_panel.addWidget(input_group)
 
+        recog_group = QGroupBox("Recognition Settings")
+        recog_layout = QVBoxLayout()
+
+        recog_layout.addWidget(QLabel("Calibration JSON"))
+        calib_row = QHBoxLayout()
+        self._txt_recog_calib_json = QLineEdit()
+        self._txt_recog_calib_json.setPlaceholderText("Select calibration result JSON...")
+        self._btn_recog_calib_browse = QPushButton("...")
+        self._btn_recog_calib_browse.setFixedWidth(32)
+        self._btn_recog_calib_browse.clicked.connect(self.recog_calib_browse_requested)
+        calib_row.addWidget(self._txt_recog_calib_json)
+        calib_row.addWidget(self._btn_recog_calib_browse)
+        recog_layout.addLayout(calib_row)
+
+        recog_layout.addWidget(QLabel("Marker Length (mm)"))
+        self._txt_recog_marker_len = centered_lineedit()
+        self._txt_recog_marker_len.setText("40")
+        recog_layout.addWidget(self._txt_recog_marker_len)
+
+        recog_layout.addWidget(QLabel("Aruco Dictionary"))
+        self._cmb_recog_dict = QComboBox()
+        self._cmb_recog_dict.addItems([
+            "DICT_4X4_50",  "DICT_4X4_100",  "DICT_4X4_250",  "DICT_4X4_1000",
+            "DICT_5X5_50",  "DICT_5X5_100",  "DICT_5X5_250",  "DICT_5X5_1000",
+            "DICT_6X6_50",  "DICT_6X6_100",  "DICT_6X6_250",  "DICT_6X6_1000",
+            "DICT_7X7_50",  "DICT_7X7_100",  "DICT_7X7_250",  "DICT_7X7_1000"])
+        self._cmb_recog_dict.setItemDelegate(CenteredComboBoxDelegate(self._cmb_recog_dict))
+        self._cmb_recog_dict.setEditable(True)
+        self._cmb_recog_dict.lineEdit().setAlignment(Qt.AlignCenter)
+        self._cmb_recog_dict.lineEdit().setReadOnly(True)
+        self._cmb_recog_dict.setStyleSheet("""QComboBox {text-align: center;}
+        QComboBox QAbstractItemView {text-align: center;}""")
+        recog_layout.addWidget(self._cmb_recog_dict)
+
+        self._chk_recog_legacy = QCheckBox("Use Legacy")
+        recog_layout.addWidget(self._chk_recog_legacy)
+
+        recog_group.setLayout(recog_layout)
+
         btn_group = QGroupBox()
         btn_layout = QVBoxLayout()
         btn_layout.setContentsMargins(10, 10, 10, 10)
+        self._btn_capture = QPushButton("Capture Images")
         self._btn_load = QPushButton("Load Images")
         self._btn_run  = QPushButton("Run Calibration")
         self._btn_save = QPushButton("Save")
+        btn_layout.addWidget(self._btn_capture)
         btn_layout.addWidget(self._btn_load)
         btn_layout.addWidget(self._btn_run)
         btn_layout.addWidget(self._btn_save)
+        btn_layout.addWidget(recog_group)
+        self._btn_recognize = QPushButton("Recognize")
+        btn_layout.addWidget(self._btn_recognize)
         btn_group.setLayout(btn_layout)
         left_panel.addWidget(btn_group)
 
@@ -180,9 +228,22 @@ class CalibrationView(QWidget):
         # --- Right Panel ---
         right_panel = QVBoxLayout()
         self._gv_image1 = QGraphicsView()
+
+        self._tbl_recog = QTableWidget(0, 5)
+        self._tbl_recog.setHorizontalHeaderLabels(
+            ["ID", "rvec", "tvec (m)", "tvec (mm)", "Reproj. Error (px)"])
+        self._tbl_recog.setEditTriggers(QTableWidget.NoEditTriggers)
+        self._tbl_recog.setSelectionBehavior(QTableWidget.SelectRows)
+        self._tbl_recog.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+        self._tbl_recog.verticalHeader().setVisible(False)
+
         self._gv_image2 = QGraphicsView()
+        self._stack_bottom = QStackedWidget()
+        self._stack_bottom.addWidget(self._gv_image2)   # index 0: graphics
+        self._stack_bottom.addWidget(self._tbl_recog)   # index 1: recognition table
+
         right_panel.addWidget(self._gv_image1)
-        right_panel.addWidget(self._gv_image2)
+        right_panel.addWidget(self._stack_bottom)
 
         # --- Main Layout ---
         main_layout = QHBoxLayout()
@@ -195,9 +256,11 @@ class CalibrationView(QWidget):
         self.setMinimumSize(1280, 720)
 
         # Connect buttons to outgoing signals
+        self._btn_capture.clicked.connect(self.capture_requested)
         self._btn_load.clicked.connect(self.load_requested)
         self._btn_run.clicked.connect(self.calibrate_requested)
         self._btn_save.clicked.connect(self.save_requested)
+        self._btn_recognize.clicked.connect(self.recognize_requested)
         self._btn_clear_all.clicked.connect(self.clear_all_requested)
         self._btn_clear_selected.clicked.connect(self.clear_selected_requested)
 
@@ -229,6 +292,21 @@ class CalibrationView(QWidget):
     def get_selected_rows(self):
         return [idx.row() for idx in self._list_loaded.selectedIndexes()]
 
+    def get_recog_calib_json(self):
+        return self._txt_recog_calib_json.text().strip()
+
+    def set_recog_calib_json(self, path):
+        self._txt_recog_calib_json.setText(path or "")
+
+    def get_recog_marker_length_mm(self):
+        return self._txt_recog_marker_len.text()
+
+    def get_recog_dict_name(self):
+        return self._cmb_recog_dict.currentText()
+
+    def get_recog_is_legacy(self):
+        return self._chk_recog_legacy.isChecked()
+
     def get_panel_size(self, panel):
         """ Return (width, height) of the viewport for the given panel (0=left, 1=right). """
         gv = self._gv_image1 if panel == 0 else self._gv_image2
@@ -253,6 +331,12 @@ class CalibrationView(QWidget):
             print(f"Warning: dictionary '{dict_name}' not found in combo box — using default.")
         self._chk_legacy.setChecked(bool(cfg.get("isLegacy", False)))
 
+        # Recognition settings default to the calibration board configuration.
+        idx = self._cmb_recog_dict.findText(dict_name)
+        if idx >= 0:
+            self._cmb_recog_dict.setCurrentIndex(idx)
+        self._chk_recog_legacy.setChecked(bool(cfg.get("isLegacy", False)))
+
     def append_image_item(self, name):
         self._list_model.appendRow(QStandardItem(name))
 
@@ -273,9 +357,24 @@ class CalibrationView(QWidget):
             field.clear()
 
     def show_image(self, img, panel, scale_already_applied=False):
-        """ Display an OpenCV image in the given panel (0=left, 1=right). """
-        gv = self._gv_image1 if panel == 0 else self._gv_image2
-        self._show_image_in_graphicsview(img, gv, scale_already_applied)
+        """ Display an OpenCV image in the given panel (0=top-left, 1=bottom). """
+        if panel == 0:
+            self._show_image_in_graphicsview(img, self._gv_image1, scale_already_applied)
+        else:
+            self._stack_bottom.setCurrentWidget(self._gv_image2)
+            self._show_image_in_graphicsview(img, self._gv_image2, scale_already_applied)
+
+    def show_recognition_table(self, rows):
+        """ Fill the recognition table and bring it to the front in the bottom panel.
+        Each row: [id, rvec_str, tvec_m_str, tvec_mm_str, reproj_str]. """
+        self._tbl_recog.setRowCount(len(rows))
+        for r, row in enumerate(rows):
+            for c, value in enumerate(row):
+                self._tbl_recog.setItem(r, c, QTableWidgetItem(str(value)))
+        self._stack_bottom.setCurrentWidget(self._tbl_recog)
+
+    def clear_recognition_table(self):
+        self._tbl_recog.setRowCount(0)
 
     def clear_image_panels(self):
         self._clear_graphics_view(self._gv_image1)

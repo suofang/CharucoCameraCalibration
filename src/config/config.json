@@ -1,9 +1,9 @@
 {
   "board": {
-    "nSquaresX": 4,
-    "nSquaresY": 6,
-    "sqrLength": 0.042,
-    "markerLength": 0.031,
+    "nSquaresX": 5,
+    "nSquaresY":7,
+    "sqrLength": 0.025,
+    "markerLength": 0.018,
     "dictName": "DICT_6X6_250",
     "isLegacy": true
   },
