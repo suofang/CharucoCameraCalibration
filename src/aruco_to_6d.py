@@ -38,6 +38,7 @@
 
 import os
 import json
+import time
 import datetime
 
 import cv2
@@ -50,70 +51,114 @@ import numpy as np
 # ======================================================================
 
 # --- 0. 标定 JSON 数据的唯一来源 -------------------------------------
-# 标定 JSON 直接内嵌于此（省略了逐图像的 data 角点段，因为位姿估计用不到）。
-# 下方所有全局变量均从该字典派生，因此只需修改此字面量即可统一改变所有
-# 使用模块全局变量的地方。
+# 直接复制本脚本 calibrate() 生成的标定 JSON 全文，替换下方字典内容即可。
+# 下方所有全局变量（内参 / 畸变 / 字典 / 标记边长等）均从该字典派生，因此
+# 只需替换此字面量即可统一改变所有使用模块全局变量的地方。
+#
+# 结构与界面 Save 按钮保存的 calibration.json 一致（省略 data 字段）：
+# {
+#     "intrinsics": {
+#         "focalLengthX": fx, "focalLengthY": fy,
+#         "principalPointX": cx, "principalPointY": cy
+#     },
+#     "lensDistortions": {
+#         "radial": {"k1": k1, "k2": k2, "k3": k3},
+#         "tangential": {"p1": p1, "p2": p2}
+#     },
+#     "calibrationSummary": {"rmsError": rms, "numImagesUsed": n},
+#     "imageSize": [w, h],
+#     "numImages": total,
+#     "arucoDictionary": "DICT_6X6_250",
+#     "board": {
+#         "nSquaresX": 5, "nSquaresY": 7,
+#         "sqrLength": 0.025, "markerLength": 0.018,
+#         "dictName": "DICT_6X6_250", "isLegacy": false
+#     },
+#     "timestamp": "..."
+# }
 CALIBRATION_JSON = {
     "intrinsics": {
         "focalLengthX": 305.8411078996921,
         "focalLengthY": 305.97810755627074,
         "principalPointX": 320.7003829948845,
-        "principalPointY": 203.67339686911853,
+        "principalPointY": 203.67339686911853
     },
     "lensDistortions": {
         "radial": {
             "k1": -0.01751871431663325,
             "k2": -0.0007132983953582356,
-            "k3": 0.01085962519418457,
+            "k3": 0.01085962519418457
         },
         "tangential": {
             "p1": -7.92705492499948e-05,
-            "p2": -0.00021055836852920917,
-        },
+            "p2": -0.00021055836852920917
+        }
     },
     "calibrationSummary": {
         "rmsError": 0.148142149786095,
-        "numImagesUsed": 35,
+        "numImagesUsed": 35
     },
+    "imageSize": [
+        640,
+        400
+    ],
+    "numImages": 42,
+    "arucoDictionary": "DICT_6X6_250",
+    "board": {
+        "nSquaresX": 5,
+        "nSquaresY": 7,
+        "sqrLength": 0.025,
+        "markerLength": 0.018,
+        "dictName": "DICT_6X6_250",
+        "isLegacy": False
+    },
+    "timestamp": "2026-11-24T15:52:52"
 }
 
 # --- 1. 相机标定参数（内参）------------------------------------------
-# 从 CALIBRATION_JSON["intrinsics"] 派生。
-_intr = CALIBRATION_JSON["intrinsics"]
-_fx = float(_intr["focalLengthX"])
-_fy = float(_intr["focalLengthY"])
-_cx = float(_intr["principalPointX"])
-_cy = float(_intr["principalPointY"])
-
-# 3x3 相机内参矩阵：
-#   [[fx,  0, cx],
-#    [ 0, fy, cy],
-#    [ 0,  0,  1]]
+# 从 CALIBRATION_JSON["intrinsics"] 派生 3x3 相机内参矩阵。
+_intr = CALIBRATION_JSON.get("intrinsics", {})
 DEFAULT_CAMERA_MATRIX = np.array([
-    [_fx, 0.0, _cx],
-    [0.0, _fy, _cy],
+    [float(_intr.get("focalLengthX", 1.0)), 0.0,
+     float(_intr.get("principalPointX", 0.0))],
+    [0.0, float(_intr.get("focalLengthY", 1.0)),
+     float(_intr.get("principalPointY", 0.0))],
     [0.0, 0.0, 1.0]], dtype=np.float64)
 
-# 畸变系数，顺序为 [k1, k2, p1, p2, k3]，从
-# CALIBRATION_JSON["lensDistortions"] 派生。
-_radial = CALIBRATION_JSON["lensDistortions"]["radial"]
-_tangential = CALIBRATION_JSON["lensDistortions"]["tangential"]
+# --- 1b. 畸变系数（从 CALIBRATION_JSON["lensDistortions"] 派生）------
+# 组装为 OpenCV 约定顺序 [k1, k2, p1, p2, k3]。
+_dist = CALIBRATION_JSON.get("lensDistortions", {})
+_radial = _dist.get("radial", {})
+_tangential = _dist.get("tangential", {})
 DEFAULT_DIST_COEFFS = np.array(
-    [float(_radial["k1"]), float(_radial["k2"]),
-     float(_tangential["p1"]), float(_tangential["p2"]),
-     float(_radial["k3"])], dtype=np.float64)
+    [float(_radial.get("k1", 0.0)), float(_radial.get("k2", 0.0)),
+     float(_tangential.get("p1", 0.0)), float(_tangential.get("p2", 0.0)),
+     float(_radial.get("k3", 0.0))], dtype=np.float64)
 
-# 标定质量摘要（从 CALIBRATION_JSON 派生）。
-DEFAULT_RMS_ERROR = float(CALIBRATION_JSON["calibrationSummary"]["rmsError"])
-DEFAULT_NUM_IMAGES_USED = int(CALIBRATION_JSON["calibrationSummary"]["numImagesUsed"])
+# 标定质量摘要（从 CALIBRATION_JSON["calibrationSummary"] 派生）。
+_summary = CALIBRATION_JSON.get("calibrationSummary", {})
+DEFAULT_RMS_ERROR = (float(_summary["rmsError"])
+                     if _summary.get("rmsError") is not None
+                     else float("nan"))
+DEFAULT_NUM_IMAGES_USED = int(_summary.get("numImagesUsed") or 0)
 
-# --- 2. ArUco 标记参数 -----------------------------------------------
+# 标定时使用的图像尺寸（宽, 高）。内参、畸变系数专门针对该尺寸标定，
+# 因此检测时必须用它来校验输入图片分辨率。若 JSON 缺失则为 None（跳过校验）。
+_json_size = CALIBRATION_JSON.get("imageSize")
+DEFAULT_IMAGE_SIZE = ((int(_json_size[0]), int(_json_size[1]))
+                      if _json_size else None)
+
+# --- 2. ArUco 标记参数（从 CALIBRATION_JSON 派生）--------------------
+_board = CALIBRATION_JSON.get("board", {})
 # 预定义字典名称，例如 DICT_6X6_250、DICT_4X4_50 ...
-DEFAULT_DICT_NAME = "DICT_6X6_250"
+DEFAULT_DICT_NAME = (CALIBRATION_JSON.get("arucoDictionary")
+                     or _board.get("dictName") or "DICT_6X6_250")
 # 是否启用旧版（legacy）字典布局。
-DEFAULT_IS_LEGACY = False
-# 黑色标记方块的实际边长（决定 tvec 的单位）。
-DEFAULT_MARKER_LENGTH_M = 0.040     # 米（40 mm）
+DEFAULT_IS_LEGACY = bool(_board.get("isLegacy", False))
+# 被检测 ArUco 标记的实际边长（决定 tvec 的单位），单位米。
+# 注意：这是「被检测的 ArUco 码」的尺寸，独立于标定棋盘中标记的尺寸
+# （CALIBRATION_JSON["board"]["markerLength"]），两者不一定相同。
+DEFAULT_DETECT_MARKER_LENGTH_M = 0.100  # 米（100 mm）
 # 相机到标记的坐标轴绘制长度，以标记边长的比例表示。
 DEFAULT_AXIS_FRACTION = 0.5
 DEFAULT_AXIS_THICKNESS = 3
@@ -122,13 +167,12 @@ DEFAULT_AXIS_THICKNESS = 3
 # 是否在输出图像上绘制检测到的标记与坐标轴。
 DEFAULT_DRAW_OVERLAY = True
 
-# --- 4. ChArUco 标定板参数 -------------------------------------------
-# 描述用于标定的已打印 ChArUco 标定板，与 src/config/config.json 保持一致。
-# 长度单位为米。
-DEFAULT_BOARD_SQUARES_X = 5
-DEFAULT_BOARD_SQUARES_Y = 7
-DEFAULT_BOARD_SQUARE_LENGTH_M = 0.025
-DEFAULT_BOARD_MARKER_LENGTH_M = 0.018
+# --- 4. ChArUco 标定板参数（从 CALIBRATION_JSON 派生）----------------
+# 描述用于标定的已打印 ChArUco 标定板。长度单位为米。
+DEFAULT_BOARD_SQUARES_X = int(_board.get("nSquaresX", 5))
+DEFAULT_BOARD_SQUARES_Y = int(_board.get("nSquaresY", 7))
+DEFAULT_BOARD_SQUARE_LENGTH_M = float(_board.get("sqrLength", 0.025))
+DEFAULT_BOARD_MARKER_LENGTH_M = float(_board.get("markerLength", 0.018))
 
 # 离群值剔除设置（对应 config.json 中的 "outlierRemoval"）。
 DEFAULT_OUTLIER_PARAMS = {
@@ -156,7 +200,7 @@ class ArucoTo6D:
     dict_name : str, 可选
         预定义 ArUco 字典名称（默认 ``DEFAULT_DICT_NAME``）。
     marker_length_m : float, 可选
-        标记边长，单位米（默认 ``DEFAULT_MARKER_LENGTH_M``）。返回的平移
+        标记边长，单位米（默认 ``DEFAULT_DETECT_MARKER_LENGTH_M``）。返回的平移
         即使用该单位。
     is_legacy : bool, 可选
         旧版（legacy）字典布局标志（默认 ``DEFAULT_IS_LEGACY``）。
@@ -196,7 +240,7 @@ class ArucoTo6D:
         if dict_name is None:
             dict_name = DEFAULT_DICT_NAME
         if marker_length_m is None:
-            marker_length_m = DEFAULT_MARKER_LENGTH_M
+            marker_length_m = DEFAULT_DETECT_MARKER_LENGTH_M
         if is_legacy is None:
             is_legacy = DEFAULT_IS_LEGACY
         if axis_fraction is None:
@@ -291,6 +335,7 @@ class ArucoTo6D:
                 tvec_mm               : [x, y, z]（毫米）
                 rvec                  : [rx, ry, rz]  OpenCV 旋转向量
                 euler_deg             : [rx, ry, rz]（与 pose6d[3:] 相同）
+                edge_length_px        : float   检测到的标记像素边长（四条边界均值）
                 reprojection_error_px : float   每个角点的平均重投影误差
         annotated_image : ndarray（仅当 return_image=True 时返回）
             绘制了检测到的标记与位姿坐标轴的 BGR 图像。
@@ -325,16 +370,33 @@ class ArucoTo6D:
         else:
             dictionary = self._build_dictionary(dict_name, is_legacy)
 
+        t_start = time.perf_counter()
+
         # --- 读取图像 ------------------------------------------------
         if not os.path.isfile(image_path):
             raise FileNotFoundError(f"Image not found: {image_path}")
         image = cv2.imread(image_path, cv2.IMREAD_COLOR)
         if image is None:
             raise ValueError(f"Could not decode image: {image_path}")
+
+        # --- 校验图像尺寸 --------------------------------------------
+        # 内参 / 畸变系数是针对 CALIBRATION_JSON["imageSize"] 标定的，
+        # 输入图片分辨率必须一致，否则位姿结果不可信。
+        if DEFAULT_IMAGE_SIZE is not None:
+            h, w = image.shape[:2]
+            exp_w, exp_h = DEFAULT_IMAGE_SIZE
+            if (w, h) != (exp_w, exp_h):
+                raise ValueError(
+                    f"图像尺寸不匹配: {os.path.basename(image_path)} 为 "
+                    f"{w}x{h}，但内参针对 {exp_w}x{exp_h} "
+                    f"（CALIBRATION_JSON['imageSize']）标定。请使用相同分辨率的图片。")
+
         gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
 
         # --- 检测标记 ------------------------------------------------
+        t_detect = time.perf_counter()
         corners, ids, _ = cv2.aruco.detectMarkers(gray, dictionary)
+        detect_ms = (time.perf_counter() - t_detect) * 1000.0
 
         annotated = image.copy()
         results = []
@@ -358,6 +420,11 @@ class ArucoTo6D:
                 tvec_mm = tvec_f * 1000.0
                 euler = self._rotation_matrix_to_euler_deg(rvec)
 
+                # 像素边长：检测到的四条边界长度平均值（与物理假设无关）。
+                px_edges = [np.linalg.norm(image_pts[i] - image_pts[(i + 1) % 4])
+                            for i in range(4)]
+                edge_length_px = float(np.mean(px_edges))
+
                 results.append({
                     "id": int(marker_id),
                     "pose6d": [float(tvec_f[0]), float(tvec_f[1]), float(tvec_f[2]),
@@ -366,6 +433,7 @@ class ArucoTo6D:
                     "tvec_mm": [float(x) for x in tvec_mm],
                     "rvec": [float(x) for x in rvec_f],
                     "euler_deg": [float(x) for x in euler],
+                    "edge_length_px": edge_length_px,
                     "reprojection_error_px": reproj,
                 })
 
@@ -387,6 +455,13 @@ class ArucoTo6D:
         if self.output_json:
             self._save_json(self.output_json, image_path, dict_name,
                             marker_length_m, results)
+
+        total_ms = (time.perf_counter() - t_start) * 1000.0
+        print(f"[aruco_to_6d] 检测耗时: 标记检测 {detect_ms:.2f} ms | "
+              f"总计 {total_ms:.2f} ms（{len(results)} 个标记）")
+        for m in results:
+            print(f"[aruco_to_6d]   ID {m['id']}: 像素边长 {m['edge_length_px']:.1f} px"
+                  f" | 重投影 {m['reprojection_error_px']:.3f} px")
 
         if return_image:
             return results, annotated
@@ -442,6 +517,8 @@ class ArucoTo6D:
         def log(msg):
             print(f"[aruco_to_6d] {msg}")
 
+        t_start = time.perf_counter()
+
         # --- 解析实际生效的参数 --------------------------------------
         if board_squares_x is None:
             board_squares_x = self.board_squares_x
@@ -487,6 +564,7 @@ class ArucoTo6D:
             f" | 旧版布局={is_legacy}")
 
         # --- 第 1 遍：读取图像并检测 ChArUco 角点 --------------------
+        t_corner = time.perf_counter()
         all_corners, all_ids, image_size = [], [], None
         for file_path in image_paths:
             name = os.path.basename(file_path)
@@ -523,6 +601,9 @@ class ArucoTo6D:
             else:
                 log(f"{name}: ChArUco 角点不足，已跳过。")
 
+        corner_s = time.perf_counter() - t_corner
+        log(f"角点检测耗时: {corner_s:.3f} s（{len(all_corners)}/{len(image_paths)} 张有效图片）")
+
         if not all_corners:
             raise RuntimeError("所有图片中均未检测到有效的 ChArUco 角点。")
         if len(all_corners) < outlier_params["minImageNum"]:
@@ -531,7 +612,9 @@ class ArucoTo6D:
 
         # --- 第 2 遍：标定（+ 迭代式离群剔除）------------------------
         # 迭代优化终止条件：达到最大迭代次数或精度满足容差。
+        t_calib = time.perf_counter()
         criteria = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_COUNT, 1000, 1e-9)
+        n_calib_runs = 1
         used = len(all_corners)
         log(f"正在对 {used} 张有效图片运行 charuco calibrate ...")
         (retval, cam_mat, dist_coeffs, _rvecs, _tvecs,
@@ -569,24 +652,39 @@ class ArucoTo6D:
                     charucoCorners=keep_corners, charucoIds=keep_ids, board=board,
                     imageSize=image_size, cameraMatrix=None, distCoeffs=None,
                     criteria=criteria)
+                n_calib_runs += 1
+
+        calib_s = time.perf_counter() - t_calib
+        log(f"标定计算耗时: {calib_s:.3f} s（共 {n_calib_runs} 次优化）")
 
         # --- 构建并保存结果 ------------------------------------------
         dist_flat = np.asarray(dist_coeffs).reshape(-1)
         k = list(dist_flat) + [0.0] * 5  # 补齐到至少 5 个系数
+        # 结构与界面 Save 按钮保存的 calibration.json 完全对齐（data 字段除外）。
         result = {
-            "fx": float(cam_mat[0, 0]),
-            "fy": float(cam_mat[1, 1]),
-            "ppx": float(cam_mat[0, 2]),
-            "ppy": float(cam_mat[1, 2]),
-            "K1": float(k[0]),
-            "K2": float(k[1]),
-            "K3": float(k[4]),
-            "P1": float(k[2]),
-            "P2": float(k[3]),
-            "reprojectionError": float(retval),
+            "intrinsics": {
+                "focalLengthX": float(cam_mat[0, 0]),
+                "focalLengthY": float(cam_mat[1, 1]),
+                "principalPointX": float(cam_mat[0, 2]),
+                "principalPointY": float(cam_mat[1, 2]),
+            },
+            "lensDistortions": {
+                "radial": {
+                    "k1": float(k[0]),
+                    "k2": float(k[1]),
+                    "k3": float(k[4]),
+                },
+                "tangential": {
+                    "p1": float(k[2]),
+                    "p2": float(k[3]),
+                },
+            },
+            "calibrationSummary": {
+                "rmsError": float(retval),
+                "numImagesUsed": int(used),
+            },
             "imageSize": list(image_size),
             "numImages": len(image_paths),
-            "numImagesUsed": int(used),
             "arucoDictionary": dict_name,
             "board": {
                 "nSquaresX": board_squares_x,
@@ -596,8 +694,6 @@ class ArucoTo6D:
                 "dictName": dict_name,
                 "isLegacy": bool(is_legacy),
             },
-            "cameraMatrix": np.asarray(cam_mat).tolist(),
-            "distCoeffs": dist_flat.tolist(),
             "timestamp": datetime.datetime.now().isoformat(timespec="seconds"),
         }
 
@@ -614,6 +710,10 @@ class ArucoTo6D:
 
         # --- 质量评价 ------------------------------------------------
         self.evaluate_calibration(result, per_view)
+
+        total_s = time.perf_counter() - t_start
+        log(f"标定总耗时: {total_s:.3f} s"
+            f"（角点检测 {corner_s:.3f} s + 标定计算 {calib_s:.3f} s）")
 
         return result
 
@@ -639,10 +739,17 @@ class ArucoTo6D:
         def log(msg):
             print(f"[aruco_to_6d] {msg}")
 
-        rms = float(result.get("reprojectionError", float("inf")))
-        num_used = int(result.get("numImagesUsed", 0))
+        summary = result.get("calibrationSummary") or {}
+        intr = result.get("intrinsics") or {}
+        rms = float(summary.get("rmsError", float("inf")))
+        num_used = int(summary.get("numImagesUsed", 0))
         num_total = int(result.get("numImages", num_used))
-        cam_mat = np.asarray(result.get("cameraMatrix"), dtype=np.float64)
+        cam_mat = np.array([
+            [float(intr.get("focalLengthX", 0.0)), 0.0,
+             float(intr.get("principalPointX", 0.0))],
+            [0.0, float(intr.get("focalLengthY", 0.0)),
+             float(intr.get("principalPointY", 0.0))],
+            [0.0, 0.0, 1.0]], dtype=np.float64)
         image_size = result.get("imageSize") or [0, 0]
         img_w, img_h = int(image_size[0]), int(image_size[1])
 
@@ -873,11 +980,25 @@ class ArucoTo6D:
 # ======================================================================
 # 内置测试 / 演示入口
 # ======================================================================
+
+def test_calibrate():
+    """在内置测试目录上运行标定流程，并打印质量评价。"""
+    detector = ArucoTo6D()
+    # 内置标定测试目录（g2 图片）。
+    TEST_CALIBRATION_DIR = r"D:\dev\workspace\iss\aruco\CharucoCameraCalibration\images\g2-20261123"
+
+    print()
+    print(f"[aruco_to_6d] 标定测试目录 : {TEST_CALIBRATION_DIR}")
+    try:
+        detector.calibrate(TEST_CALIBRATION_DIR)
+    except Exception as e:
+        print(f"[aruco_to_6d] 标定测试失败: {e}")
+
 def test_detect():
     """在内置测试图片上运行检测，并打印每个标记的 6D 位姿。"""
     detector = ArucoTo6D()
     # 内置测试图片。
-    TEST_IMAGE = r"D:\dev\workspace\iss\aruco\CharucoCameraCalibration\images\g2-20261123\110-right-g2.jpg"
+    TEST_IMAGE = r"D:\dev\workspace\iss\aruco\CharucoCameraCalibration\images\g2-20261123\110-left-g2.jpg"
 
     
     print(f"[aruco_to_6d] 测试图片 : {TEST_IMAGE}")
@@ -894,7 +1015,8 @@ def test_detect():
 
     print(f"[aruco_to_6d] 检测到 {len(results)} 个标记:")
     header = (f"{'ID':>4} | {'x(mm)':>9} {'y(mm)':>9} {'z(mm)':>9} | "
-                f"{'rx(度)':>9} {'ry(度)':>9} {'rz(度)':>9} | {'重投影(px)':>10}")
+                f"{'rx(度)':>9} {'ry(度)':>9} {'rz(度)':>9} | "
+                f"{'像素边长(px)':>11} | {'重投影(px)':>10}")
     print(header)
     print("-" * len(header))
     for m in results:
@@ -902,29 +1024,17 @@ def test_detect():
         rx, ry, rz = m["euler_deg"]
         print(f"{m['id']:>4} | {x:>9.1f} {y:>9.1f} {z:>9.1f} | "
                 f"{rx:>9.2f} {ry:>9.2f} {rz:>9.2f} | "
+                f"{m['edge_length_px']:>11.2f} | "
                 f"{m['reprojection_error_px']:>10.3f}")
 
-
-def test_calibrate():
-    """在内置测试目录上运行标定流程，并打印质量评价。"""
-    detector = ArucoTo6D()
-    # 内置标定测试目录（g2 图片）。
-    TEST_CALIBRATION_DIR = r"D:\dev\workspace\iss\aruco\CharucoCameraCalibration\images\g2-20261123"
-
-    print()
-    print(f"[aruco_to_6d] 标定测试目录 : {TEST_CALIBRATION_DIR}")
-    try:
-        detector.calibrate(TEST_CALIBRATION_DIR)
-    except Exception as e:
-        print(f"[aruco_to_6d] 标定测试失败: {e}")
 
 
 def _main():
     # 测试标定
-    test_calibrate()
+    # test_calibrate()
     
     # 测试检测
-    # test_detect()
+    test_detect()
 
 
 if __name__ == "__main__":
