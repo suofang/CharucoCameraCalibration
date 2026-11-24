@@ -1,19 +1,17 @@
-"""Standalone ArUco -> 6D pose (position + orientation) recognition tool.
+"""独立的 ArUco -> 6D 位姿（位置 + 姿态）识别工具。
 
-This module detects ArUco markers in an image and estimates each marker's full
-6-DoF pose (translation + rotation) relative to the camera. It is independent of
-the PyQt calibration GUI and can be imported or run directly.
+本模块在图像中检测 ArUco 标记，并估计每个标记相对于相机的完整 6 自由度位姿
+（平移 + 旋转）。它不依赖 PyQt 标定界面，既可被导入，也可直接运行。
 
-The recognition logic is encapsulated in the :class:`ArucoTo6D` class. All
-tunable inputs (camera intrinsics, ArUco parameters, image options) are passed
-to the constructor.
+识别逻辑封装在 :class:`ArucoTo6D` 类中。所有可调输入（相机内参、ArUco 参数、
+图像选项）均通过构造函数传入。
 
-Usage
------
-    # Run the built-in test on a local image:
+使用方法
+--------
+    # 在本地图片上运行内置测试：
     python aruco_to_6d.py
 
-    # Or use as a library:
+    # 或作为库使用：
     from aruco_to_6d import ArucoTo6D
     detector = ArucoTo6D(
         camera_matrix=...,
@@ -25,19 +23,17 @@ Usage
     for m in results:
         print(m["id"], m["pose6d"])
 
-Dependencies (install in the same environment, e.g. the "aruco" conda env):
-    pip install opencv-contrib-python==4.12.0.88 numpy
+依赖（请在同一环境中安装，例如 "aruco" conda 环境）：
+    pip install opencv-contrib-python==4.12.0.88 opencv-python==4.12.0.88 numpy==2.2.6 --force-reinstall
 
-Coordinate / convention notes
------------------------------
-* Translation ``tvec`` is expressed in the SAME unit as ``marker_length_m``
-  (default: meters).
-* Rotation is returned BOTH as an OpenCV rotation vector (``rvec``) and as
-  Euler angles in degrees (``euler_deg = [rx, ry, rz]``) using the intrinsic
-  XYZ (roll-pitch-yaw) convention of ``R = Rx * Ry * Rz``.
-* The object frame origin is the marker center, with the marker lying on the
-  Z=0 plane (normal points toward +Z, out of the printed face).
-* Results are returned sorted by ascending marker id.
+坐标系 / 约定说明
+-----------------
+* 平移 ``tvec`` 的单位与 ``marker_length_m`` 相同（默认：米）。
+* 旋转同时以 OpenCV 旋转向量（``rvec``）和欧拉角（度）返回
+  （``euler_deg = [rx, ry, rz]``），采用内旋 XYZ（横滚-俯仰-偏航）约定
+  ``R = Rx * Ry * Rz``。
+* 物体坐标系原点为标记中心，标记位于 Z=0 平面（法线指向 +Z，朝向打印面外侧）。
+* 结果按标记 id 升序返回。
 """
 
 import os
@@ -49,15 +45,14 @@ import numpy as np
 
 
 # ======================================================================
-# Default parameter values (used by the built-in test / demo).
-# Edit these or pass your own values to the ArucoTo6D constructor.
+# 默认参数值（供内置测试 / 演示使用）。
+# 可直接修改此处，或通过 ArucoTo6D 构造函数传入自定义值。
 # ======================================================================
 
-# --- 0. Calibration JSON source of truth -----------------------------
-# The calibration JSON is embedded here verbatim (the ``data`` per-image
-# corner section is omitted because it is not needed for pose estimation).
-# Every other global below is derived from this dict, so editing this literal
-# is enough to re-point every consumer of the module globals.
+# --- 0. 标定 JSON 数据的唯一来源 -------------------------------------
+# 标定 JSON 直接内嵌于此（省略了逐图像的 data 角点段，因为位姿估计用不到）。
+# 下方所有全局变量均从该字典派生，因此只需修改此字面量即可统一改变所有
+# 使用模块全局变量的地方。
 CALIBRATION_JSON = {
     "intrinsics": {
         "focalLengthX": 305.8411078996921,
@@ -82,15 +77,15 @@ CALIBRATION_JSON = {
     },
 }
 
-# --- 1. Camera calibration parameters (intrinsics) --------------------
-# Derived from CALIBRATION_JSON["intrinsics"].
+# --- 1. 相机标定参数（内参）------------------------------------------
+# 从 CALIBRATION_JSON["intrinsics"] 派生。
 _intr = CALIBRATION_JSON["intrinsics"]
 _fx = float(_intr["focalLengthX"])
 _fy = float(_intr["focalLengthY"])
 _cx = float(_intr["principalPointX"])
 _cy = float(_intr["principalPointY"])
 
-# Camera matrix 3x3:
+# 3x3 相机内参矩阵：
 #   [[fx,  0, cx],
 #    [ 0, fy, cy],
 #    [ 0,  0,  1]]
@@ -99,8 +94,8 @@ DEFAULT_CAMERA_MATRIX = np.array([
     [0.0, _fy, _cy],
     [0.0, 0.0, 1.0]], dtype=np.float64)
 
-# Distortion coefficients in order [k1, k2, p1, p2, k3], derived from
-# CALIBRATION_JSON["lensDistortions"].
+# 畸变系数，顺序为 [k1, k2, p1, p2, k3]，从
+# CALIBRATION_JSON["lensDistortions"] 派生。
 _radial = CALIBRATION_JSON["lensDistortions"]["radial"]
 _tangential = CALIBRATION_JSON["lensDistortions"]["tangential"]
 DEFAULT_DIST_COEFFS = np.array(
@@ -108,39 +103,34 @@ DEFAULT_DIST_COEFFS = np.array(
      float(_tangential["p1"]), float(_tangential["p2"]),
      float(_radial["k3"])], dtype=np.float64)
 
-# Calibration quality summary (derived from CALIBRATION_JSON).
+# 标定质量摘要（从 CALIBRATION_JSON 派生）。
 DEFAULT_RMS_ERROR = float(CALIBRATION_JSON["calibrationSummary"]["rmsError"])
 DEFAULT_NUM_IMAGES_USED = int(CALIBRATION_JSON["calibrationSummary"]["numImagesUsed"])
 
-# --- 2. ArUco marker parameters --------------------------------------
-# Predefined dictionary name, e.g. DICT_6X6_250, DICT_4X4_50, ...
+# --- 2. ArUco 标记参数 -----------------------------------------------
+# 预定义字典名称，例如 DICT_6X6_250、DICT_4X4_50 ...
 DEFAULT_DICT_NAME = "DICT_6X6_250"
-# Whether to enable the legacy dictionary layout.
+# 是否启用旧版（legacy）字典布局。
 DEFAULT_IS_LEGACY = False
-# Physical side length of the black marker square (defines tvec unit).
-DEFAULT_MARKER_LENGTH_M = 0.040     # meters (40 mm)
-# Camera-to-marker axis drawing length, as a fraction of the marker length.
+# 黑色标记方块的实际边长（决定 tvec 的单位）。
+DEFAULT_MARKER_LENGTH_M = 0.040     # 米（40 mm）
+# 相机到标记的坐标轴绘制长度，以标记边长的比例表示。
 DEFAULT_AXIS_FRACTION = 0.5
 DEFAULT_AXIS_THICKNESS = 3
 
-# --- 3. Image / processing parameters --------------------------------
-# Whether to draw detected markers and axes on the output image.
+# --- 3. 图像 / 处理参数 ----------------------------------------------
+# 是否在输出图像上绘制检测到的标记与坐标轴。
 DEFAULT_DRAW_OVERLAY = True
-# Built-in test image.
-TEST_IMAGE = os.path.join(
-    os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-    "images", "g2-20261123", "130-left-g2.jpg",
-)
 
-# --- 4. ChArUco board calibration parameters -------------------------
-# These describe the printed ChArUco board used for calibration. They mirror
-# src/config/config.json. Lengths are in meters.
+# --- 4. ChArUco 标定板参数 -------------------------------------------
+# 描述用于标定的已打印 ChArUco 标定板，与 src/config/config.json 保持一致。
+# 长度单位为米。
 DEFAULT_BOARD_SQUARES_X = 5
 DEFAULT_BOARD_SQUARES_Y = 7
 DEFAULT_BOARD_SQUARE_LENGTH_M = 0.025
 DEFAULT_BOARD_MARKER_LENGTH_M = 0.018
 
-# Outlier-removal settings (mirror config.json "outlierRemoval").
+# 离群值剔除设置（对应 config.json 中的 "outlierRemoval"）。
 DEFAULT_OUTLIER_PARAMS = {
     "reprojectionErrorThreshold": 1.0,
     "maxOutlierRemovalIterations": 3,
@@ -149,46 +139,38 @@ DEFAULT_OUTLIER_PARAMS = {
     "minImageNum": 4,
 }
 
-# Built-in calibration test directory (g2 images).
-TEST_CALIBRATION_DIR = os.path.join(
-    os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-    "images", "g2-20261123",
-)
-
 
 class ArucoTo6D:
-    """Detect ArUco markers and estimate each marker's 6D pose.
+    """检测 ArUco 标记并估计每个标记的 6D 位姿。
 
-    All parameters are optional. Any parameter left as ``None`` falls back to
-    the corresponding module-level default (see the ``DEFAULT_*`` constants and
-    ``DEFAULT_CAMERA_MATRIX`` / ``DEFAULT_DIST_COEFFS`` at the top of the file).
+    所有参数均可选。任一参数若为 ``None``，则回退到对应的模块级默认值
+    （见文件顶部的 ``DEFAULT_*`` 常量以及 ``DEFAULT_CAMERA_MATRIX`` /
+    ``DEFAULT_DIST_COEFFS``）。
 
-    Parameters
-    ----------
-    camera_matrix : ndarray, optional
-        3x3 camera intrinsic matrix (default ``DEFAULT_CAMERA_MATRIX``).
-    dist_coeffs : ndarray, optional
-        Distortion coefficients [k1, k2, p1, p2, k3] (default
-        ``DEFAULT_DIST_COEFFS``).
-    dict_name : str, optional
-        Predefined ArUco dictionary name (default ``DEFAULT_DICT_NAME``).
-    marker_length_m : float, optional
-        Marker side length in meters (default ``DEFAULT_MARKER_LENGTH_M``). The
-        returned translation uses this unit.
-    is_legacy : bool, optional
-        Legacy dictionary layout flag (default ``DEFAULT_IS_LEGACY``).
-    axis_fraction : float, optional
-        Drawn axis length as a fraction of the marker length (default
-        ``DEFAULT_AXIS_FRACTION``).
-    axis_thickness : int, optional
-        Drawn axis line thickness (default ``DEFAULT_AXIS_THICKNESS``).
-    draw_overlay : bool, optional
-        Whether to draw detected markers and axes (default
-        ``DEFAULT_DRAW_OVERLAY``).
-    output_image : str or None, optional
-        Path to save the annotated image; ``None`` disables saving.
-    output_json : str or None, optional
-        Path to save the JSON result; ``None`` disables saving.
+    参数
+    ----
+    camera_matrix : ndarray, 可选
+        3x3 相机内参矩阵（默认 ``DEFAULT_CAMERA_MATRIX``）。
+    dist_coeffs : ndarray, 可选
+        畸变系数 [k1, k2, p1, p2, k3]（默认 ``DEFAULT_DIST_COEFFS``）。
+    dict_name : str, 可选
+        预定义 ArUco 字典名称（默认 ``DEFAULT_DICT_NAME``）。
+    marker_length_m : float, 可选
+        标记边长，单位米（默认 ``DEFAULT_MARKER_LENGTH_M``）。返回的平移
+        即使用该单位。
+    is_legacy : bool, 可选
+        旧版（legacy）字典布局标志（默认 ``DEFAULT_IS_LEGACY``）。
+    axis_fraction : float, 可选
+        绘制的坐标轴长度，以标记边长的比例表示（默认
+        ``DEFAULT_AXIS_FRACTION``）。
+    axis_thickness : int, 可选
+        绘制的坐标轴线宽（默认 ``DEFAULT_AXIS_THICKNESS``）。
+    draw_overlay : bool, 可选
+        是否绘制检测到的标记与坐标轴（默认 ``DEFAULT_DRAW_OVERLAY``）。
+    output_image : str 或 None, 可选
+        标注图像的保存路径；``None`` 表示不保存。
+    output_json : str 或 None, 可选
+        JSON 结果的保存路径；``None`` 表示不保存。
     """
 
     def __init__(self,
@@ -245,17 +227,18 @@ class ArucoTo6D:
         self.output_image = output_image
         self.output_json = output_json
 
-        # ChArUco board (calibration) parameters.
+        # ChArUco 标定板（标定用）参数。
         self.board_squares_x = int(board_squares_x)
         self.board_squares_y = int(board_squares_y)
         self.board_square_length_m = float(board_square_length_m)
         self.board_marker_length_m = float(board_marker_length_m)
         self.outlier_params = outlier_params
 
+        # 预先构建 OpenCV 字典对象，避免每次检测重复构建。
         self._dictionary = self._build_dictionary(dict_name, is_legacy)
 
     # ------------------------------------------------------------------
-    # Public API
+    # 对外公开 API
     # ------------------------------------------------------------------
     def detect(self,
                image_path,
@@ -268,53 +251,51 @@ class ArucoTo6D:
                axis_thickness=None,
                draw_overlay=None,
                return_image=False):
-        """Detect ArUco markers and estimate each marker's 6D pose.
+        """检测 ArUco 标记并估计每个标记的 6D 位姿。
 
-        All ArUco / camera parameters are optional per-call overrides. Any
-        parameter left as ``None`` falls back to the value stored on the
-        instance (which itself defaults to the module-level globals).
+        所有 ArUco / 相机参数均可在单次调用时覆盖。任一参数若为 ``None``，则
+        回退到实例上保存的值（实例值本身又默认来自模块级全局变量）。
 
-        Parameters
-        ----------
+        参数
+        ----
         image_path : str
-            Path to the input image.
-        marker_length_m : float, optional
-            Marker side length in meters. Overrides the instance value.
-        dict_name : str, optional
-            Predefined ArUco dictionary name. Overrides the instance value.
-        is_legacy : bool, optional
-            Legacy dictionary layout flag. Overrides the instance value.
-        camera_matrix : ndarray, optional
-            3x3 camera intrinsic matrix. Overrides the instance value.
-        dist_coeffs : ndarray, optional
-            Distortion coefficients. Overrides the instance value.
-        axis_fraction : float, optional
-            Drawn axis length fraction. Overrides the instance value.
-        axis_thickness : int, optional
-            Drawn axis line thickness. Overrides the instance value.
-        draw_overlay : bool, optional
-            Whether to draw detected markers and axes. Overrides the instance
-            value.
-        return_image : bool, optional
-            If True, also return the annotated BGR image.
+            输入图像路径。
+        marker_length_m : float, 可选
+            标记边长，单位米。覆盖实例值。
+        dict_name : str, 可选
+            预定义 ArUco 字典名称。覆盖实例值。
+        is_legacy : bool, 可选
+            旧版（legacy）字典布局标志。覆盖实例值。
+        camera_matrix : ndarray, 可选
+            3x3 相机内参矩阵。覆盖实例值。
+        dist_coeffs : ndarray, 可选
+            畸变系数。覆盖实例值。
+        axis_fraction : float, 可选
+            绘制的坐标轴长度比例。覆盖实例值。
+        axis_thickness : int, 可选
+            绘制的坐标轴线宽。覆盖实例值。
+        draw_overlay : bool, 可选
+            是否绘制检测到的标记与坐标轴。覆盖实例值。
+        return_image : bool, 可选
+            若为 True，则同时返回标注后的 BGR 图像。
 
-        Returns
-        -------
-        results : list[dict]  (sorted by ascending marker id)
-            Each dict contains:
-                id                    : int   marker id
+        返回
+        ----
+        results : list[dict]（按标记 id 升序排列）
+            每个字典包含：
+                id                    : int   标记 id
                 pose6d                : [x, y, z, rx, ry, rz]
-                                        x,y,z = tvec (in marker_length unit);
-                                        rx,ry,rz = Euler angles in degrees
-                tvec                  : [x, y, z]  (marker_length unit)
-                tvec_mm               : [x, y, z]  (millimeters)
-                rvec                  : [rx, ry, rz]  OpenCV rotation vector
-                euler_deg             : [rx, ry, rz]  (same as pose6d[3:])
-                reprojection_error_px : float   mean per-corner reprojection error
-        annotated_image : ndarray (only if return_image=True)
-            BGR image with detected markers and pose axes drawn.
+                                        x,y,z = tvec（单位同 marker_length）；
+                                        rx,ry,rz = 欧拉角（度）
+                tvec                  : [x, y, z]（单位同 marker_length）
+                tvec_mm               : [x, y, z]（毫米）
+                rvec                  : [rx, ry, rz]  OpenCV 旋转向量
+                euler_deg             : [rx, ry, rz]（与 pose6d[3:] 相同）
+                reprojection_error_px : float   每个角点的平均重投影误差
+        annotated_image : ndarray（仅当 return_image=True 时返回）
+            绘制了检测到的标记与位姿坐标轴的 BGR 图像。
         """
-        # --- Resolve effective parameters (per-call overrides) -------
+        # --- 解析本次调用实际生效的参数（单次覆盖）------------------
         if marker_length_m is None:
             marker_length_m = self.marker_length_m
         if dict_name is None:
@@ -338,13 +319,13 @@ class ArucoTo6D:
         axis_fraction = float(axis_fraction)
         axis_thickness = int(axis_thickness)
 
-        # Rebuild the dictionary only when the requested one differs.
+        # 仅当请求的字典与实例不同时才重建字典对象。
         if dict_name == self.dict_name and is_legacy == self.is_legacy:
             dictionary = self._dictionary
         else:
             dictionary = self._build_dictionary(dict_name, is_legacy)
 
-        # --- Load image ----------------------------------------------
+        # --- 读取图像 ------------------------------------------------
         if not os.path.isfile(image_path):
             raise FileNotFoundError(f"Image not found: {image_path}")
         image = cv2.imread(image_path, cv2.IMREAD_COLOR)
@@ -352,7 +333,7 @@ class ArucoTo6D:
             raise ValueError(f"Could not decode image: {image_path}")
         gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
 
-        # --- Detect markers ------------------------------------------
+        # --- 检测标记 ------------------------------------------------
         corners, ids, _ = cv2.aruco.detectMarkers(gray, dictionary)
 
         annotated = image.copy()
@@ -367,7 +348,7 @@ class ArucoTo6D:
                 if not ok:
                     continue
 
-                # Reprojection error (mean per-corner distance in pixels).
+                # 重投影误差（各角点距离的平均值，单位像素）。
                 proj_pts, _ = cv2.projectPoints(obj_pts, rvec, tvec, cam, dist)
                 reproj = float(np.mean(np.linalg.norm(
                     proj_pts.reshape(-1, 2) - image_pts, axis=1)))
@@ -395,7 +376,7 @@ class ArucoTo6D:
             if draw_overlay:
                 cv2.aruco.drawDetectedMarkers(annotated, corners, ids)
 
-        # Sort by ascending marker id (stable order for downstream consumers).
+        # 按标记 id 升序排序（保证下游使用者的顺序稳定）。
         results.sort(key=lambda m: m["id"])
 
         if self.output_image:
@@ -412,7 +393,7 @@ class ArucoTo6D:
         return results
 
     # ------------------------------------------------------------------
-    # Calibration
+    # 标定
     # ------------------------------------------------------------------
     def calibrate(self,
                   image_dir,
@@ -424,44 +405,44 @@ class ArucoTo6D:
                   dict_name=None,
                   is_legacy=None,
                   outlier_params=None):
-        """Calibrate the camera from a directory of ChArUco board images.
+        """从包含 ChArUco 标定板图像的目录中标定相机。
 
-        Mirrors the "Run Calibration" button of the GUI: it loads every image
-        in ``image_dir``, detects ChArUco corners, runs
-        ``cv2.aruco.calibrateCameraCharucoExtended`` with optional iterative
-        outlier removal, writes a JSON result file and logs progress.
+        对应 GUI 的 "Run Calibration" 按钮：读取 ``image_dir`` 下的每张图片，
+        检测 ChArUco 角点，调用 ``cv2.aruco.calibrateCameraCharucoExtended``
+        并可选进行迭代式离群剔除，最后写出 JSON 结果文件并打印进度日志。
 
-        Any parameter left as ``None`` falls back to the value stored on the
-        instance (which itself defaults to the module-level globals).
+        任一参数若为 ``None``，则回退到实例上保存的值（实例值本身又默认来自
+        模块级全局变量）。
 
-        Parameters
-        ----------
+        参数
+        ----
         image_dir : str
-            Directory containing the calibration images.
-        output_json : str, optional
-            Path of the JSON result file. Defaults to ``image_dir/calibration.json``.
-        board_squares_x, board_squares_y : int, optional
-            Number of squares along the X / Y axis.
-        board_square_length_m, board_marker_length_m : float, optional
-            Chessboard square / marker side length in meters.
-        dict_name : str, optional
-            Predefined ArUco dictionary name.
-        is_legacy : bool, optional
-            Legacy dictionary layout flag.
-        outlier_params : dict, optional
-            Outlier-removal settings (see ``DEFAULT_OUTLIER_PARAMS``).
+            包含标定图像的目录。
+        output_json : str, 可选
+            JSON 结果文件的路径。默认为
+            ``<image_dir>/calibration-{YYYYMMDD_HHMMSS}.json``。
+        board_squares_x, board_squares_y : int, 可选
+            沿 X / Y 轴的方格数量。
+        board_square_length_m, board_marker_length_m : float, 可选
+            棋盘方格 / 标记的边长，单位米。
+        dict_name : str, 可选
+            预定义 ArUco 字典名称。
+        is_legacy : bool, 可选
+            旧版（legacy）字典布局标志。
+        outlier_params : dict, 可选
+            离群值剔除设置（见 ``DEFAULT_OUTLIER_PARAMS``）。
 
-        Returns
-        -------
+        返回
+        ----
         dict
-            Calibration result: ``fx``, ``fy``, ``ppx``, ``ppy``, ``K1``,
-            ``K2``, ``K3``, ``P1``, ``P2``, plus ``reprojectionError``,
-            ``imageSize``, ``numImages`` and ``numImagesUsed``.
+            标定结果：``fx``、``fy``、``ppx``、``ppy``、``K1``、``K2``、
+            ``K3``、``P1``、``P2``，以及 ``reprojectionError``、``imageSize``、
+            ``numImages``、``numImagesUsed``。
         """
         def log(msg):
             print(f"[aruco_to_6d] {msg}")
 
-        # --- Resolve effective parameters ----------------------------
+        # --- 解析实际生效的参数 --------------------------------------
         if board_squares_x is None:
             board_squares_x = self.board_squares_x
         if board_squares_y is None:
@@ -480,9 +461,10 @@ class ArucoTo6D:
         if not os.path.isdir(image_dir):
             raise NotADirectoryError(f"Image directory not found: {image_dir}")
         if output_json is None:
-            output_json = os.path.join(image_dir, "calibration.json")
+            stamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+            output_json = os.path.join(image_dir, f"calibration-{stamp}.json")
 
-        # --- Build board and dictionary -----------------------------
+        # --- 构建标定板与字典 ----------------------------------------
         dictionary = self._build_dictionary(dict_name, is_legacy)
         board = self._create_charuco_board(
             board_squares_x, board_squares_y, board_square_length_m,
@@ -504,7 +486,7 @@ class ArucoTo6D:
             f" | 标记={board_marker_length_m * 1000:.1f} mm | 字典={dict_name}"
             f" | 旧版布局={is_legacy}")
 
-        # --- Pass 1: load images and detect ChArUco corners ---------
+        # --- 第 1 遍：读取图像并检测 ChArUco 角点 --------------------
         all_corners, all_ids, image_size = [], [], None
         for file_path in image_paths:
             name = os.path.basename(file_path)
@@ -547,10 +529,11 @@ class ArucoTo6D:
             log(f"警告: 仅有 {len(all_corners)} 张有效图片，"
                 f"minImageNum 为 {outlier_params['minImageNum']}。")
 
-        # --- Pass 2: calibrate (+ iterative outlier removal) --------
+        # --- 第 2 遍：标定（+ 迭代式离群剔除）------------------------
+        # 迭代优化终止条件：达到最大迭代次数或精度满足容差。
         criteria = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_COUNT, 1000, 1e-9)
         used = len(all_corners)
-        log(f"正在对 {used} 张有效图片运行 calibrateCameraCharucoExtended ...")
+        log(f"正在对 {used} 张有效图片运行 charuco calibrate ...")
         (retval, cam_mat, dist_coeffs, _rvecs, _tvecs,
          _std_int, _std_ext, per_view) = cv2.aruco.calibrateCameraCharucoExtended(
             charucoCorners=all_corners, charucoIds=all_ids, board=board,
@@ -563,6 +546,7 @@ class ArucoTo6D:
                 f"开始剔除离群图片 ...")
             keep = np.arange(used)
             for _ in range(outlier_params["maxOutlierRemovalIterations"]):
+                # 使用 MAD（中位数绝对偏差）对单张图误差做归一化，较 RMS 更抗离群。
                 per_view_flat = np.asarray(per_view).reshape(-1)
                 median = np.median(per_view_flat)
                 mad = np.median(np.abs(per_view_flat - median))
@@ -586,9 +570,9 @@ class ArucoTo6D:
                     imageSize=image_size, cameraMatrix=None, distCoeffs=None,
                     criteria=criteria)
 
-        # --- Build and save the result ------------------------------
+        # --- 构建并保存结果 ------------------------------------------
         dist_flat = np.asarray(dist_coeffs).reshape(-1)
-        k = list(dist_flat) + [0.0] * 5  # pad to at least 5 coefficients
+        k = list(dist_flat) + [0.0] * 5  # 补齐到至少 5 个系数
         result = {
             "fx": float(cam_mat[0, 0]),
             "fy": float(cam_mat[1, 1]),
@@ -628,31 +612,29 @@ class ArucoTo6D:
         log(f"使用 {used}/{len(image_paths)} 张图片。")
         log(f"标定结果已保存到 JSON: {output_json}")
 
-        # --- Quality evaluation ------------------------------------
+        # --- 质量评价 ------------------------------------------------
         self.evaluate_calibration(result, per_view)
 
         return result
 
     def evaluate_calibration(self, result, per_view=None):
-        """Evaluate a calibration result, log it and suggest improvements.
+        """评价标定结果，打印日志并给出改进建议。
 
-        Grades the RMS reprojection error, the inlier ratio, image coverage
-        and (when available) per-view error spread, then emits concrete,
-        actionable improvement suggestions for anything that looks weak.
+        对 RMS 重投影误差、有效图片比例、图像覆盖度，以及（若有）单张视角
+        误差离散程度进行分级，并针对表现较弱之处给出具体、可操作的改进建议。
 
-        Parameters
-        ----------
+        参数
+        ----
         result : dict
-            A calibration result as returned by :meth:`calibrate`.
-        per_view : array-like, optional
-            Per-view reprojection errors (pixels). When provided, per-image
-            consistency is also evaluated.
+            :meth:`calibrate` 返回的标定结果。
+        per_view : array-like, 可选
+            单张视角的重投影误差（像素）。提供后会额外评估逐图一致性。
 
-        Returns
-        -------
+        返回
+        ----
         dict
             ``{"grade": str, "score": int, "rms": float, "issues": [...],
-            "suggestions": [...]}``.
+            "suggestions": [...]}``。
         """
         def log(msg):
             print(f"[aruco_to_6d] {msg}")
@@ -667,7 +649,7 @@ class ArucoTo6D:
         issues = []
         suggestions = []
 
-        # --- 1. RMS reprojection error ------------------------------
+        # --- 1. RMS 重投影误差 --------------------------------------
         if rms <= 0.3:
             rms_level = "优秀"
         elif rms <= 0.5:
@@ -692,7 +674,7 @@ class ArucoTo6D:
                 "误差偏高：增加更多不同姿态（含倾斜、远近变化）的图片，"
                 "确保标定板角点检测完整。")
 
-        # --- 2. Inlier image ratio ----------------------------------
+        # --- 2. 有效（内点）图片比例 --------------------------------
         inlier_ratio = (num_used / num_total) if num_total else 0.0
         log(f"有效图片数              : {num_used}/{num_total} "
             f"（{inlier_ratio * 100:.1f}%）")
@@ -707,7 +689,7 @@ class ArucoTo6D:
                 "较多图片被剔除：检查这些图片中 ChArUco 角点是否被完整检测，"
                 "避免标定板越界、模糊或反光。")
 
-        # --- 3. Focal length sanity --------------------------------
+        # --- 3. 焦距合理性 ------------------------------------------
         if cam_mat.size == 9 and img_w and img_h:
             fx, fy = cam_mat[0, 0], cam_mat[1, 1]
             ratio = fx / fy if fy else 0.0
@@ -719,7 +701,7 @@ class ArucoTo6D:
                     "fx 与 fy 差异偏大：通常由图片覆盖区域不足或标定板姿态单一引起，"
                     "应让标定板出现在图像各个区域（尤其四角）。")
 
-        # --- 4. Image coverage (principal point near center) --------
+        # --- 4. 图像覆盖度（主点应接近图像中心）---------------------
         if cam_mat.size == 9 and img_w and img_h:
             cx, cy = cam_mat[0, 2], cam_mat[1, 2]
             dx = abs(cx - img_w / 2.0) / (img_w / 2.0)
@@ -732,7 +714,7 @@ class ArucoTo6D:
                     "主点明显偏移：确保标定板覆盖图像四周而非集中在中心，"
                     "增加标定板位于画面边缘的图片。")
 
-        # --- 5. Per-view error consistency --------------------------
+        # --- 5. 单张视角误差一致性 ----------------------------------
         if per_view is not None:
             pv = np.asarray(per_view, dtype=np.float64).reshape(-1)
             pv = pv[np.isfinite(pv)]
@@ -747,7 +729,7 @@ class ArucoTo6D:
                         "存在个别误差异常大的图片：移除这些图片后重新标定，"
                         "它们很可能是失焦或角点检测错误的样本。")
 
-        # --- Overall grade -----------------------------------------
+        # --- 综合评级 ----------------------------------------------
         score = 100
         score -= min(60, int(rms * 40))
         if num_used < 10:
@@ -788,7 +770,7 @@ class ArucoTo6D:
     @staticmethod
     def _create_charuco_board(squares_x, squares_y, square_length,
                               marker_length, aruco_dict):
-        """Create a ChArUco board across OpenCV API variants."""
+        """兼容不同 OpenCV API 版本创建 ChArUco 标定板。"""
         if hasattr(cv2.aruco, "CharucoBoard_create"):
             try:
                 return cv2.aruco.CharucoBoard_create(
@@ -809,14 +791,14 @@ class ArucoTo6D:
                 f"Unable to create CharucoBoard. Error: {e}")
 
     # ------------------------------------------------------------------
-    # Internal helpers
+    # 内部辅助函数
     # ------------------------------------------------------------------
     @staticmethod
     def _build_dictionary(dict_name, is_legacy):
-        """Create a predefined ArUco dictionary object.
+        """创建预定义 ArUco 字典对象。
 
-        ``Dictionary.setLegacyPattern`` is not exposed on every OpenCV build, so
-        the legacy flag is applied defensively.
+        ``Dictionary.setLegacyPattern`` 并非在所有 OpenCV 构建中都提供，
+        因此这里对旧版布局标志做防御式设置。
         """
         enum_val = getattr(cv2.aruco, dict_name, None)
         if enum_val is None:
@@ -825,16 +807,15 @@ class ArucoTo6D:
         try:
             dictionary.setLegacyPattern(bool(is_legacy))
         except AttributeError:
-            # Older / alternate builds may place the flag on the detector
-            # instead; detection still works with the default layout.
+            # 旧版或其他构建可能把该标志放在检测器上；使用默认布局仍可正常检测。
             pass
         return dictionary
 
     @staticmethod
     def _rotation_matrix_to_euler_deg(rvec):
-        """Convert an OpenCV rotation vector to intrinsic XYZ Euler angles (deg).
+        """将 OpenCV 旋转向量转换为内旋 XYZ 欧拉角（度）。
 
-        Uses R = Rx(rx) * Ry(ry) * Rz(rz):
+        采用 R = Rx(rx) * Ry(ry) * Rz(rz)：
             ry = atan2(-R[2,0], sqrt(R[0,0]^2 + R[1,0]^2))
             rx = atan2(R[2,1], R[2,2])
             rz = atan2(R[1,0], R[0,0])
@@ -845,7 +826,7 @@ class ArucoTo6D:
             rx = np.arctan2(rot[2, 1], rot[2, 2])
             ry = np.arctan2(-rot[2, 0], sy)
             rz = np.arctan2(rot[1, 0], rot[0, 0])
-        else:  # gimbal lock
+        else:  # 万向节死锁情况
             rx = np.arctan2(-rot[1, 2], rot[1, 1])
             ry = np.arctan2(-rot[2, 0], sy)
             rz = 0.0
@@ -853,10 +834,10 @@ class ArucoTo6D:
 
     @staticmethod
     def _marker_object_points(marker_length):
-        """3D corner coordinates of a marker centered at origin on the Z=0 plane.
+        """标记位于 Z=0 平面、中心在原点时的 3D 角点坐标。
 
-        Corner order matches OpenCV's detectMarkers order:
-        top-left, top-right, bottom-right, bottom-left.
+        角点顺序与 OpenCV detectMarkers 一致：
+        左上、右上、右下、左下。
         """
         half = marker_length / 2.0
         return np.array([
@@ -872,7 +853,7 @@ class ArucoTo6D:
             os.makedirs(parent, exist_ok=True)
 
     def _save_json(self, path, image_path, dict_name, marker_length_m, results):
-        """Write recognition results to a JSON file (schema shared with the GUI)."""
+        """将识别结果写入 JSON 文件（与 GUI 共享相同的数据结构）。"""
         self._ensure_parent(path)
         payload = {
             "sourceImage": os.path.abspath(image_path),
@@ -890,16 +871,20 @@ class ArucoTo6D:
 
 
 # ======================================================================
-# Built-in test / demo entry point
+# 内置测试 / 演示入口
 # ======================================================================
-def _main():
+def test_detect():
+    """在内置测试图片上运行检测，并打印每个标记的 6D 位姿。"""
     detector = ArucoTo6D()
+    # 内置测试图片。
+    TEST_IMAGE = r"D:\dev\workspace\iss\aruco\CharucoCameraCalibration\images\g2-20261123\110-right-g2.jpg"
 
+    
     print(f"[aruco_to_6d] 测试图片 : {TEST_IMAGE}")
     print(f"[aruco_to_6d] 内参     : "
-          f"(fx={detector.camera_matrix[0, 0]:.3f}, fy={detector.camera_matrix[1, 1]:.3f})")
+            f"(fx={detector.camera_matrix[0, 0]:.3f}, fy={detector.camera_matrix[1, 1]:.3f})")
     print(f"[aruco_to_6d] 字典     : {detector.dict_name} | 标记边长 = "
-          f"{detector.marker_length_m * 1000:.1f} mm | 旧版布局 = {detector.is_legacy}")
+            f"{detector.marker_length_m * 1000:.1f} mm | 旧版布局 = {detector.is_legacy}")
 
     results = detector.detect(TEST_IMAGE)
 
@@ -909,26 +894,37 @@ def _main():
 
     print(f"[aruco_to_6d] 检测到 {len(results)} 个标记:")
     header = (f"{'ID':>4} | {'x(mm)':>9} {'y(mm)':>9} {'z(mm)':>9} | "
-              f"{'rx(度)':>9} {'ry(度)':>9} {'rz(度)':>9} | {'重投影(px)':>10}")
+                f"{'rx(度)':>9} {'ry(度)':>9} {'rz(度)':>9} | {'重投影(px)':>10}")
     print(header)
     print("-" * len(header))
     for m in results:
         x, y, z = m["tvec_mm"]
         rx, ry, rz = m["euler_deg"]
         print(f"{m['id']:>4} | {x:>9.1f} {y:>9.1f} {z:>9.1f} | "
-              f"{rx:>9.2f} {ry:>9.2f} {rz:>9.2f} | "
-              f"{m['reprojection_error_px']:>10.3f}")
+                f"{rx:>9.2f} {ry:>9.2f} {rz:>9.2f} | "
+                f"{m['reprojection_error_px']:>10.3f}")
 
-    # --- Demo calibration from the built-in test directory ----------
+
+def test_calibrate():
+    """在内置测试目录上运行标定流程，并打印质量评价。"""
+    detector = ArucoTo6D()
+    # 内置标定测试目录（g2 图片）。
+    TEST_CALIBRATION_DIR = r"D:\dev\workspace\iss\aruco\CharucoCameraCalibration\images\g2-20261123"
+
     print()
-    print(f"[aruco_to_6d] 标定演示目录 : {TEST_CALIBRATION_DIR}")
-    out_json = os.path.join(
-        os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-        "results", "calibration_demo.json")
+    print(f"[aruco_to_6d] 标定测试目录 : {TEST_CALIBRATION_DIR}")
     try:
-        detector.calibrate(TEST_CALIBRATION_DIR, output_json=out_json)
+        detector.calibrate(TEST_CALIBRATION_DIR)
     except Exception as e:
-        print(f"[aruco_to_6d] 标定演示失败: {e}")
+        print(f"[aruco_to_6d] 标定测试失败: {e}")
+
+
+def _main():
+    # 测试标定
+    test_calibrate()
+    
+    # 测试检测
+    # test_detect()
 
 
 if __name__ == "__main__":
