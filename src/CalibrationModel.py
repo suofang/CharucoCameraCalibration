@@ -1,6 +1,7 @@
 import os
 import cv2
 import json
+import datetime
 import traceback
 import numpy as np
 from PyQt5.QtCore import QObject, pyqtSignal
@@ -285,7 +286,8 @@ class CalibrationModel(QObject):
 
         try:
             os.makedirs(self.last_image_dir, exist_ok=True)
-            out_path = self.last_image_dir +  "/calibration.json"
+            timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+            out_path = f"{self.last_image_dir}/GUI-calibration-{timestamp}.json"
 
             cm = self.camera_matrix
             dc = self.dist_coeffs.flatten()
