@@ -40,9 +40,21 @@ import os
 import json
 import time
 import datetime
+import enum
 
 import cv2
 import numpy as np
+
+
+class MarkerSortOrder(enum.Enum):
+    """检测结果排序方式。"""
+
+    ID_ASC = "ID_ASC"           # 按标记 id 升序（默认）
+    ID_DESC = "ID_DESC"         # 按标记 id 降序
+    LEFT_FIRST = "LEFT_FIRST"   # 从左到右（中心 x 升序）
+    RIGHT_FIRST = "RIGHT_FIRST"  # 从右到左（中心 x 降序）
+    TOP_FIRST = "TOP_FIRST"     # 从上到下（中心 y 升序）
+    BOTTOM = "BOTTOM"           # 从下到上（中心 y 降序）
 
 
 # ======================================================================
@@ -294,7 +306,8 @@ class ArucoTo6D:
                axis_fraction=None,
                axis_thickness=None,
                draw_overlay=None,
-               return_image=False):
+               return_image=False,
+               sort_by=MarkerSortOrder.ID_ASC):
         """检测 ArUco 标记并估计每个标记的 6D 位姿。
 
         所有 ArUco / 相机参数均可在单次调用时覆盖。任一参数若为 ``None``，则
@@ -322,10 +335,18 @@ class ArucoTo6D:
             是否绘制检测到的标记与坐标轴。覆盖实例值。
         return_image : bool, 可选
             若为 True，则同时返回标注后的 BGR 图像。
+        sort_by : MarkerSortOrder, 可选
+            检测结果的排序方式（默认 ``MarkerSortOrder.ID_ASC``）：
+                MarkerSortOrder.ID_ASC      : 按标记 id 升序（默认）
+                MarkerSortOrder.ID_DESC     : 按标记 id 降序
+                MarkerSortOrder.LEFT_FIRST  : 从左到右（按标记中心 x 升序）
+                MarkerSortOrder.RIGHT_FIRST : 从右到左（按标记中心 x 降序）
+                MarkerSortOrder.TOP_FIRST   : 从上到下（按标记中心 y 升序）
+                MarkerSortOrder.BOTTOM      : 从下到上（按标记中心 y 降序）
 
         返回
         ----
-        results : list[dict]（按标记 id 升序排列）
+        results : list[dict]（按 ``sort_by`` 指定的顺序排列）
             每个字典包含：
                 id                    : int   标记 id
                 pose6d                : [x, y, z, rx, ry, rz]
@@ -435,6 +456,7 @@ class ArucoTo6D:
                     "euler_deg": [float(x) for x in euler],
                     "edge_length_px": edge_length_px,
                     "reprojection_error_px": reproj,
+                    "center_px": [float(c) for c in image_pts.mean(axis=0)],
                 })
 
                 if draw_overlay:
@@ -444,8 +466,8 @@ class ArucoTo6D:
             if draw_overlay:
                 cv2.aruco.drawDetectedMarkers(annotated, corners, ids)
 
-        # 按标记 id 升序排序（保证下游使用者的顺序稳定）。
-        results.sort(key=lambda m: m["id"])
+        # 按 sort_by 指定的方式排序（保证下游使用者的顺序稳定）。
+        results = self._sort_results(results, sort_by)
 
         if self.output_image:
             self._ensure_parent(self.output_image)
@@ -459,9 +481,23 @@ class ArucoTo6D:
         total_ms = (time.perf_counter() - t_start) * 1000.0
         print(f"[aruco_to_6d] 检测耗时: 标记检测 {detect_ms:.2f} ms | "
               f"总计 {total_ms:.2f} ms（{len(results)} 个标记）")
-        for m in results:
-            print(f"[aruco_to_6d]   ID {m['id']}: 像素边长 {m['edge_length_px']:.1f} px"
-                  f" | 重投影 {m['reprojection_error_px']:.3f} px")
+        print(f"[aruco_to_6d] 检测到 {len(results)} 个标记：")
+        if results:
+            header = (f"{'ID':>4} | {'中心x(px)':>9} {'中心y(px)':>9} | "
+                      f"{'x(mm)':>9} {'y(mm)':>9} {'z(mm)':>9} | "
+                      f"{'rx(度)':>9} {'ry(度)':>9} {'rz(度)':>9} | "
+                      f"{'像素边长(px)':>11} | {'重投影(px)':>10}")
+            print(f"[aruco_to_6d] {header}")
+            print(f"[aruco_to_6d] {'-' * len(header)}")
+            for m in results:
+                cx, cy = m["center_px"]
+                x, y, z = m["tvec_mm"]
+                rx, ry, rz = m["euler_deg"]
+                print(f"[aruco_to_6d] {m['id']:>4} | {cx:>9.1f} {cy:>9.1f} | "
+                      f"{x:>9.1f} {y:>9.1f} {z:>9.1f} | "
+                      f"{rx:>9.2f} {ry:>9.2f} {rz:>9.2f} | "
+                      f"{m['edge_length_px']:>11.2f} | "
+                      f"{m['reprojection_error_px']:>10.3f}")
 
         if return_image:
             return results, annotated
@@ -954,6 +990,41 @@ class ArucoTo6D:
             [-half, -half, 0.0]], dtype=np.float64)
 
     @staticmethod
+    def _sort_results(results, sort_by):
+        """按指定方式对检测结果排序并返回新列表。
+
+        参数
+        ----
+        results : list[dict]
+            :meth:`detect` 生成的结果列表（每项含 id / center_px）。
+        sort_by : MarkerSortOrder
+            排序方式（见 :class:`MarkerSortOrder`）。
+
+        返回
+        ----
+        list[dict]
+            排序后的新列表（不修改入参）。
+        """
+        if sort_by is None:
+            sort_by = MarkerSortOrder.ID_ASC
+        if not isinstance(sort_by, MarkerSortOrder):
+            raise TypeError(
+                f"sort_by 必须是 MarkerSortOrder 枚举，而非 {type(sort_by).__name__}")
+        if sort_by is MarkerSortOrder.ID_ASC:
+            return sorted(results, key=lambda m: m["id"])
+        if sort_by is MarkerSortOrder.ID_DESC:
+            return sorted(results, key=lambda m: m["id"], reverse=True)
+        if sort_by is MarkerSortOrder.LEFT_FIRST:
+            return sorted(results, key=lambda m: m["center_px"][0])
+        if sort_by is MarkerSortOrder.RIGHT_FIRST:
+            return sorted(results, key=lambda m: m["center_px"][0], reverse=True)
+        if sort_by is MarkerSortOrder.TOP_FIRST:
+            return sorted(results, key=lambda m: m["center_px"][1])
+        if sort_by is MarkerSortOrder.BOTTOM:
+            return sorted(results, key=lambda m: m["center_px"][1], reverse=True)
+        raise ValueError(f"Unknown sort_by: {sort_by!r}")
+
+    @staticmethod
     def _ensure_parent(path):
         parent = os.path.dirname(os.path.abspath(path))
         if parent:
@@ -1012,20 +1083,6 @@ def test_detect():
     if not results:
         print("[aruco_to_6d] 未检测到 ArUco 标记。")
         return
-
-    print(f"[aruco_to_6d] 检测到 {len(results)} 个标记:")
-    header = (f"{'ID':>4} | {'x(mm)':>9} {'y(mm)':>9} {'z(mm)':>9} | "
-                f"{'rx(度)':>9} {'ry(度)':>9} {'rz(度)':>9} | "
-                f"{'像素边长(px)':>11} | {'重投影(px)':>10}")
-    print(header)
-    print("-" * len(header))
-    for m in results:
-        x, y, z = m["tvec_mm"]
-        rx, ry, rz = m["euler_deg"]
-        print(f"{m['id']:>4} | {x:>9.1f} {y:>9.1f} {z:>9.1f} | "
-                f"{rx:>9.2f} {ry:>9.2f} {rz:>9.2f} | "
-                f"{m['edge_length_px']:>11.2f} | "
-                f"{m['reprojection_error_px']:>10.3f}")
 
 
 
