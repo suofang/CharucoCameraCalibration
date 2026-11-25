@@ -24,7 +24,9 @@
         print(m["id"], m["pose6d"])
 
 依赖（请在同一环境中安装，例如 "aruco" conda 环境）：
-    pip install opencv-contrib-python==4.12.0.88 opencv-python==4.12.0.88 numpy==2.2.6 --force-reinstall
+    # 同时兼容 opencv-contrib-python 4.12.0.88 与 5.0.0.93，任选其一：
+    pip install opencv-contrib-python==4.12.0.88 numpy==2.2.6 --force-reinstall
+    pip install opencv-contrib-python==5.0.0.93 numpy --force-reinstall
 
 坐标系 / 约定说明
 -----------------
@@ -416,7 +418,8 @@ class ArucoTo6D:
 
         # --- 检测标记 ------------------------------------------------
         t_detect = time.perf_counter()
-        corners, ids, _ = cv2.aruco.detectMarkers(gray, dictionary)
+        aruco_detector = self._make_aruco_detector(dictionary)
+        corners, ids, _ = aruco_detector.detectMarkers(gray)
         detect_ms = (time.perf_counter() - t_detect) * 1000.0
 
         annotated = image.copy()
@@ -519,7 +522,8 @@ class ArucoTo6D:
         """从包含 ChArUco 标定板图像的目录中标定相机。
 
         对应 GUI 的 "Run Calibration" 按钮：读取 ``image_dir`` 下的每张图片，
-        检测 ChArUco 角点，调用 ``cv2.aruco.calibrateCameraCharucoExtended``
+        用 ``cv2.aruco.CharucoDetector`` 检测 ChArUco 角点，再经
+        ``board.matchImagePoints`` + ``cv2.calibrateCameraExtended`` 标定
         并可选进行迭代式离群剔除，最后写出 JSON 结果文件并打印进度日志。
 
         任一参数若为 ``None``，则回退到实例上保存的值（实例值本身又默认来自
@@ -601,6 +605,7 @@ class ArucoTo6D:
 
         # --- 第 1 遍：读取图像并检测 ChArUco 角点 --------------------
         t_corner = time.perf_counter()
+        charuco_detector = self._make_charuco_detector(board)
         all_corners, all_ids, image_size = [], [], None
         for file_path in image_paths:
             name = os.path.basename(file_path)
@@ -613,21 +618,10 @@ class ArucoTo6D:
                 image_size = (w, h)
 
             try:
-                corners, ids, _ = cv2.aruco.detectMarkers(img, dictionary)
+                charuco_corners, charuco_ids, _mcorners, _mids = \
+                    charuco_detector.detectBoard(img)
             except Exception as e:
-                log(f"{name}: ArUco 标记检测出错: {e}")
-                continue
-
-            if ids is None or len(ids) == 0:
-                log(f"{name}: 未检测到标记，已跳过。")
-                continue
-
-            try:
-                _, charuco_corners, charuco_ids = cv2.aruco.interpolateCornersCharuco(
-                    markerCorners=corners, markerIds=ids,
-                    image=img, board=board)
-            except Exception as e:
-                log(f"{name}: ChArUco 角点插值出错: {e}")
+                log(f"{name}: ChArUco 角点检测出错: {e}")
                 continue
 
             if charuco_corners is not None and charuco_ids is not None and len(charuco_ids) > 3:
@@ -654,10 +648,8 @@ class ArucoTo6D:
         used = len(all_corners)
         log(f"正在对 {used} 张有效图片运行 charuco calibrate ...")
         (retval, cam_mat, dist_coeffs, _rvecs, _tvecs,
-         _std_int, _std_ext, per_view) = cv2.aruco.calibrateCameraCharucoExtended(
-            charucoCorners=all_corners, charucoIds=all_ids, board=board,
-            imageSize=image_size, cameraMatrix=None, distCoeffs=None,
-            criteria=criteria)
+         _std_int, _std_ext, per_view) = self._calibrate_from_corners(
+            board, all_corners, all_ids, image_size, criteria)
 
         if retval > outlier_params["reprojectionErrorThreshold"]:
             log(f"重投影误差 ({retval:.4f}) 超过阈值 "
@@ -684,10 +676,8 @@ class ArucoTo6D:
                 keep_ids = [all_ids[i] for i in keep]
                 log(f"使用 {used} 张有效图片重新标定 ...")
                 (retval, cam_mat, dist_coeffs, _rvecs, _tvecs,
-                 _std_int, _std_ext, per_view) = cv2.aruco.calibrateCameraCharucoExtended(
-                    charucoCorners=keep_corners, charucoIds=keep_ids, board=board,
-                    imageSize=image_size, cameraMatrix=None, distCoeffs=None,
-                    criteria=criteria)
+                 _std_int, _std_ext, per_view) = self._calibrate_from_corners(
+                    board, keep_corners, keep_ids, image_size, criteria)
                 n_calib_runs += 1
 
         calib_s = time.perf_counter() - t_calib
@@ -911,21 +901,55 @@ class ArucoTo6D:
         }
 
     @staticmethod
+    def _make_aruco_detector(dictionary):
+        """创建 ArUco 标记检测器。
+
+        同时兼容 opencv-contrib-python 4.12.x 与 5.0.x：两者均提供面向对象
+        的 ``cv2.aruco.ArucoDetector``（5.0 已移除模块级 ``detectMarkers``）。
+        """
+        return cv2.aruco.ArucoDetector(
+            dictionary, cv2.aruco.DetectorParameters())
+
+    @staticmethod
+    def _make_charuco_detector(board):
+        """创建 ChArUco 检测器。
+
+        同时兼容 opencv-contrib-python 4.12.x 与 5.0.x：两者均提供
+        ``cv2.aruco.CharucoDetector``（5.0 已移除模块级
+        ``interpolateCornersCharuco``）。
+        """
+        return cv2.aruco.CharucoDetector(board)
+
+    @staticmethod
+    def _calibrate_from_corners(board, charuco_corners, charuco_ids,
+                                image_size, criteria):
+        """由 ChArUco 角点标定相机（兼容 4.12.x 与 5.0.x）。
+
+        5.0 已移除 ``cv2.aruco.calibrateCameraCharucoExtended``，统一改用
+        ``board.matchImagePoints`` + ``cv2.calibrateCameraExtended``。显式传入
+        ``np.eye(3)`` / ``np.zeros(5)`` 作为初始猜测（与 ``None`` 等价，但跨版本
+        更鲁棒；且每次新建，避免被上一次结果原地污染）。
+        """
+        obj_pts_all, img_pts_all = [], []
+        for corners, ids in zip(charuco_corners, charuco_ids):
+            obj_pts, img_pts = board.matchImagePoints(corners, ids)
+            obj_pts_all.append(obj_pts)
+            img_pts_all.append(img_pts)
+        camera_matrix = np.eye(3, dtype=np.float64)
+        dist_coeffs = np.zeros(5, dtype=np.float64)
+        return cv2.calibrateCameraExtended(
+            obj_pts_all, img_pts_all, image_size, camera_matrix, dist_coeffs,
+            criteria=criteria)
+
+    @staticmethod
     def _create_charuco_board(squares_x, squares_y, square_length,
                               marker_length, aruco_dict):
-        """兼容不同 OpenCV API 版本创建 ChArUco 标定板。"""
-        if hasattr(cv2.aruco, "CharucoBoard_create"):
-            try:
-                return cv2.aruco.CharucoBoard_create(
-                    squares_x, squares_y, square_length, marker_length, aruco_dict)
-            except Exception:
-                pass
-        if hasattr(cv2.aruco, "CharucoBoard") and hasattr(cv2.aruco.CharucoBoard, "create"):
-            try:
-                return cv2.aruco.CharucoBoard.create(
-                    squares_x, squares_y, square_length, marker_length, aruco_dict)
-            except Exception:
-                pass
+        """创建 ChArUco 标定板。
+
+        4.12.x 与 5.0.x 均支持 ``CharucoBoard((sx, sy), sq, mk, dict)``
+        构造形式（``CharucoBoard_create`` / ``CharucoBoard.create`` 已废弃或
+        不存在）。
+        """
         try:
             return cv2.aruco.CharucoBoard(
                 (squares_x, squares_y), square_length, marker_length, aruco_dict)
@@ -940,19 +964,15 @@ class ArucoTo6D:
     def _build_dictionary(dict_name, is_legacy):
         """创建预定义 ArUco 字典对象。
 
-        ``Dictionary.setLegacyPattern`` 并非在所有 OpenCV 构建中都提供，
-        因此这里对旧版布局标志做防御式设置。
+        旧版（legacy）布局标志由 :class:`cv2.aruco.CharucoBoard` 的
+        ``setLegacyPattern`` 控制（见 ``calibrate``），字典对象本身在
+        4.12.x / 5.0.x 中均不提供该接口，故此处不再设置。``is_legacy``
+        参数仅为保持签名兼容而保留。
         """
         enum_val = getattr(cv2.aruco, dict_name, None)
         if enum_val is None:
             raise ValueError(f"Unknown ArUco dictionary: {dict_name}")
-        dictionary = cv2.aruco.getPredefinedDictionary(enum_val)
-        try:
-            dictionary.setLegacyPattern(bool(is_legacy))
-        except AttributeError:
-            # 旧版或其他构建可能把该标志放在检测器上；使用默认布局仍可正常检测。
-            pass
-        return dictionary
+        return cv2.aruco.getPredefinedDictionary(enum_val)
 
     @staticmethod
     def _rotation_matrix_to_euler_deg(rvec):
